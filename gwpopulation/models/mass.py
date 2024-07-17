@@ -1015,9 +1015,17 @@ class BaseSmoothedPrimarySecondaryDistribution(BaseSmoothedMassDistribution):
                 raise ValueError(
                     "{self.__class__}: mmax ({mmax}) > self.mmax ({self.mmax})"
                 )
-
-        p_m1 = self.p_m1(dataset, **kwargs, **self.kwargs)
-        p_m2 = self.p_m2(dataset, **kwargs, **self.kwargs)
+           
+        # separate arguments for m1m2 models with different variables
+        try:
+            kwargs1 = {key: kwargs[key] for key in self.model1_vars}
+            kwargs2 = {key: kwargs[key] for key in self.model2_vars}
+            p_m1 = self.p_m1(dataset, **kwargs1, **self.kwargs)
+            p_m2 = self.p_m2(dataset, **kwargs2, **self.kwargs)
+        except:
+            p_m1 = self.p_m1(dataset, **kwargs, **self.kwargs)
+            p_m2 = self.p_m2(dataset, **kwargs, **self.kwargs)
+                        
         prob = _primary_secondary_general(dataset, p_m1, p_m2)
         return prob
 
@@ -1134,15 +1142,18 @@ class SinglePeakIndependentSmoothedPrimarySecondaryDistribution(BaseSmoothedPrim
     This means that the `mmax` parameter is _not_ the global maximum.
     """
 
-    def model1(mass, alpha_1, mmin, mmax, lam_1, mpp_1, sigpp_1, gaussian_mass_maximum=100):
-        return two_component_single(mass, alpha_1, mmin, mmax, lam_1, mpp_1, sigpp_1,
+    model1_vars = ['alpha_1', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp', 'delta_m']
+    model2_vars = ['alpha_2', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp', 'delta_m']
+    
+    def model1(mass, alpha_1, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha_1, mmin, mmax, lam, mpp, sigpp,
                                     gaussian_mass_maximum=gaussian_mass_maximum)
     
     primary_model = model1
     
     # if mass2 model has unique parameters, their names can be changed here
-    def model2(mass, alpha_2, mmin, mmax, lam_2, mpp_2, sigpp_2, gaussian_mass_maximum=100):
-        return two_component_single(mass, alpha_2, mmin, mmax, lam_2, mpp_2, sigpp_2,
+    def model2(mass, alpha_2, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha_2, mmin, mmax, lam, mpp, sigpp,
                                     gaussian_mass_maximum=gaussian_mass_maximum)
     
     secondary_model = model2
