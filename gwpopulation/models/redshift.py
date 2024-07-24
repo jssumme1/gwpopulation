@@ -5,7 +5,7 @@ Implemented redshift models
 import numpy as xp
 
 from ..experimental.cosmo_models import CosmoMixin
-from ..utils import powerlaw
+from ..utils import powerlaw, inverse_cdf_time_delay
 
 __all__ = [
     "_Redshift",
@@ -308,6 +308,17 @@ class TimeDelayRedshift(_Redshift):
         
         return powerlaw(tau, kappa_d, hubble_time, tau_min)
     
+    def MadauDickinson_SFR(self, redshift):
+        gamma = 2.7
+        kappa = 5.6
+        z_peak = 1.9
+        
+        psi_of_z = (1 + redshift) ** gamma / (
+            1 + ((1 + redshift) / (1 + z_peak)) ** kappa
+        )
+        psi_of_z *= 1 + (1 + z_peak) ** (-kappa)
+        return psi_of_z
+    
     def inverse_cdf_time_delay(self, prob, **parameters):
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
@@ -319,26 +330,19 @@ class TimeDelayRedshift(_Redshift):
             return tau_min * xp.exp(prob * xp.log(hubble_time / tau_min))
                     
     def redshift_from_lookback_time(self, lookback_time, **parameters):
-        # cut out times that are too large
+        # save redshift grid and lookback time grid
+        if not hasattr(self, 'redshift_grid'):
+            self.redshift_grid = xp.logspace(-5, 3, 10000)
+        if not hasattr(self, 'lookback_time_grid'):
+            self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
+
         hubble_time = self.cosmology(parameters).hubble_time
         lookback_time *= (lookback_time <= hubble_time)
+        z = xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid)
         
-        # need to numerically invert the lookback time to get the redshift
-        redshift_grid = xp.linspace(0, 100, 10000)
-        lookback_time = lookback_time[:, : ,xp.newaxis]
-        redshift_grid = redshift_grid[xp.newaxis, xp.newaxis, :]
-        lookback_time_broadcast = lookback_time * xp.ones(redshift_grid.shape)
-        redshift_grid_broadcast = redshift_grid * xp.ones(lookback_time.shape)
+        return z
         
-        # select the last time that is less than the target lookback time
-        # then index redshift from that time
-        times = self.cosmology(parameters).lookback_time(redshift_grid)
-        mask = (times <= lookback_time) & (times != 0)
-        closest_index = xp.count_nonzero(mask, axis=2, keepdims=True) - 1
-        closest_redshift = xp.take_along_axis(redshift_grid_broadcast, closest_index, axis=2)
-        return closest_redshift
-
-    def psi_of_z(self, redshift, **parameters):
+    def psi_of_z(self, redshift, num_samples=10000, **parameters):
         r"""
         Madau-Dickinson model convolved with a time delay distribution.
 
@@ -357,23 +361,21 @@ class TimeDelayRedshift(_Redshift):
         """
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
-        
         hubble_time = self.cosmology(parameters).hubble_time
-        tau_grid = xp.linspace(tau_min, hubble_time, 2500)
         
-        SFR = MadauDickinsonRedshift().psi_of_z(self.redshift_from_lookback_time(
-                        self.cosmology(parameters).lookback_time(redshift)[:, xp.newaxis] + tau_grid[xp.newaxis, :], **parameters), 
-                                              gamma=2.7, z_peak=1.9, kappa=5.6)
-        tau_probability = self.time_delay(tau_grid[xp.newaxis, :], **parameters)
-                       
-        psi_of_z = xp.trapz(SFR[:,:,0] * tau_probability, tau_grid, axis=1)
+        # add zero to front for normalization
+        redshift = xp.append(0, redshift)
         
-        # normalize it so psi(0) = 1
-        SFR_z0 = MadauDickinsonRedshift().psi_of_z(self.redshift_from_lookback_time(
-                        tau_grid[xp.newaxis, :], **parameters), 
-                                                   gamma=2.7, z_peak=1.9, kappa=5.6)
-        normalization = xp.trapz(SFR_z0[:,:,0] * tau_probability, tau_grid, axis=1)
+        rng = xp.random.default_rng()
+        #num_samples = int(1e4)
+        tau_samples = inverse_cdf_time_delay(rng.random(num_samples), kappa_d, tau_min, hubble_time)
+
+        SFR = self.MadauDickinson_SFR(self.redshift_from_lookback_time(
+                    self.cosmology(parameters).lookback_time(redshift)[:, xp.newaxis] + tau_samples[xp.newaxis, :], **parameters))
+                
+        psi_of_z = xp.sum(SFR, axis=1) / num_samples
         
-        psi_of_z *= 1 / normalization
+        # normalize it
+        psi_of_z = psi_of_z[1:] / psi_of_z[0]
         
         return psi_of_z
