@@ -948,3 +948,209 @@ class InterpolatedPowerlaw(
         p_m *= xp.exp(self._norm_spline(y=f_splines))
         norm = xp.trapz(p_m, self.m1s)
         return norm
+
+    
+class BaseSmoothedPrimarySecondaryDistribution(BaseSmoothedMassDistribution):
+    """
+    Generic smoothed mass (m1 and m2) distribution base class.
+    Alternative to BaseSmoothedMassDistribution, which assumes
+    a primary mass and mass ratio model.
+
+    Implements low-mass smoothing on m1 and m2. Requires p_m1 
+    and p_m2 to be implemented.
+
+    Parameters
+    ==========
+    mmin: float
+        The minimum mass considered for numerical normalization
+    mmax: float
+        The maximum mass considered for numerical normalization
+    """
+
+    # if the models should have differently named, need to
+    # define a function for secondary_model
+    primary_model = None
+    secondary_model = None
+
+    @property
+    def variable_names(self):
+        vars = getattr(
+            self.primary_model,
+            "variable_names",
+            inspect.getfullargspec(self.primary_model).args[1:],
+        )
+        # only add variables that aren't in mass1 model
+        model2_names = getattr(
+            self.secondary_model,
+            "variable_names",
+            inspect.getfullargspec(self.secondary_model).args[1:],
+        )
+        unique_model2_names = [name for name in model2_names if name not in vars]
+        vars += unique_model2_names
+        
+        vars += ["delta_m"]
+        vars = set(vars).difference(self.kwargs.keys())
+        return vars
+
+    def __init__(self, mmin=2, mmax=100, normalization_shape=1000):
+        self.mmin = mmin
+        self.mmax = mmax
+        self.m1s = xp.linspace(mmin, mmax, normalization_shape)
+        self.m2s = xp.linspace(mmin, mmax, normalization_shape)
+        self.dm1 = self.m1s[1] - self.m1s[0]
+        self.dm2 = self.m2s[1] - self.m2s[0]
+        self.m1s_grid, self.m2s_grid = xp.meshgrid(self.m1s, self.m2s)
+
+    def __call__(self, dataset, *args, **kwargs):
+        mmin = kwargs.get("mmin", self.mmin)
+        mmax = kwargs.get("mmax", self.mmax)
+        if "jax" not in xp.__name__:
+            if mmin < self.mmin:
+                raise ValueError(
+                    "{self.__class__}: mmin ({mmin}) < self.mmin ({self.mmin})"
+                )
+            if mmax > self.mmax:
+                raise ValueError(
+                    "{self.__class__}: mmax ({mmax}) > self.mmax ({self.mmax})"
+                )
+           
+        # separate arguments for m1m2 models with different variables
+        try:
+            kwargs1 = {key: kwargs[key] for key in (self.model1_vars + ['delta_m'])}
+            kwargs2 = {key: kwargs[key] for key in (self.model2_vars + ['delta_m'])}
+            p_m1 = self.p_m1(dataset, **kwargs1, **self.kwargs)
+            p_m2 = self.p_m2(dataset, **kwargs2, **self.kwargs)
+        except:
+            p_m1 = self.p_m1(dataset, **kwargs, **self.kwargs)
+            p_m2 = self.p_m2(dataset, **kwargs, **self.kwargs)
+                        
+        prob = _primary_secondary_general(dataset, p_m1, p_m2)
+        return prob
+
+    def p_m2(self, dataset, **kwargs):
+        # same idea as p_m1 but using the secondary model
+        mmin = kwargs.get("mmin", self.mmin)
+        delta_m = kwargs.pop("delta_m", 0)
+        p_m = self.__class__.secondary_model(dataset["mass_2"], **kwargs)
+        p_m *= self.smoothing(
+            dataset["mass_2"], mmin=mmin, mmax=self.mmax, delta_m=delta_m
+        )
+        norm = self.norm_p_m2(delta_m=delta_m, **kwargs)
+        return p_m / norm
+
+    def norm_p_m2(self, delta_m, **kwargs):
+        # same idea as norm_p_m2 but using the secondary model
+        """Calculate the normalisation factor for the primary mass"""
+        mmin = kwargs.get("mmin", self.mmin)
+        if "jax" not in xp.__name__ and delta_m == 0:
+            return 1
+        p_m = self.__class__.secondary_model(self.m1s, **kwargs)
+        p_m *= self.smoothing(self.m2s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
+
+        norm = xp.nan_to_num(xp.trapz(p_m, self.m2s)) * (delta_m != 0) + 1 * (
+            delta_m == 0
+        )
+        return norm
+
+    
+class SinglePeakIdenticalSmoothedPrimarySecondaryDistribution(BaseSmoothedPrimarySecondaryDistribution):
+    """
+    Powerlaw + peak model for two-dimensional mass distribution with
+    low mass smoothing. Model for primary and secondary mass have the
+    exact same parameters (identical).
+
+    Parameters
+    ----------
+    dataset: dict
+        Dictionary of numpy arrays for 'mass_1' and 'mass_2'.
+    alpha: float
+        Negative power law exponent for more massive black hole.
+    mmin: float
+        Minimum black hole mass.
+    mmax: float
+        Maximum black hole mass.
+    lam: float
+        Fraction of black holes in the Gaussian component.
+    mpp: float
+        Mean of the Gaussian component.
+    sigpp: float
+        Standard deviation of the Gaussian component.
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    delta_m: float
+        Rise length of the low end of the mass distribution.
+
+    Notes
+    -----
+    The Gaussian components are bounded between [`mmin`, `self.mmax`].
+    This means that the `mmax` parameter is _not_ the global maximum.
+    """
+
+    primary_model = two_component_single
+    
+    # if mass2 model has unique parameters, their names can be changed here
+    def model2(mass, alpha, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+    
+    secondary_model = model2
+
+    @property
+    def kwargs(self):
+        return dict(gaussian_mass_maximum=self.mmax)
+
+
+class SinglePeakIndependentSmoothedPrimarySecondaryDistribution(BaseSmoothedPrimarySecondaryDistribution):
+    """
+    Powerlaw + peak model for two-dimensional mass distribution with
+    low mass smoothing. Model for primary and secondary mass have the
+    independent parameters.
+
+    Parameters
+    ----------
+    dataset: dict
+        Dictionary of numpy arrays for 'mass_1' and 'mass_2'.
+    alpha: float
+        Negative power law exponent for more massive black hole.
+    beta: float
+        Negative power law exponent for less massive black hole.
+    mmin: float
+        Minimum black hole mass.
+    mmax: float
+        Maximum black hole mass.
+    lam: float
+        Fraction of black holes in the Gaussian component (primary mass).
+    mpp: float
+        Mean of the Gaussian component for more massive black hole.
+    sigpp: float
+        Standard deviation of the Gaussian component for more massive black hole.
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    delta_m: float
+        Rise length of the low end of the mass distribution for more massive black hole.
+
+    Notes
+    -----
+    The Gaussian components are bounded between [`mmin`, `self.mmax`].
+    This means that the `mmax` parameter is _not_ the global maximum.
+    """
+
+    model1_vars = ['alpha', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp']
+    model2_vars = ['beta', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp']
+    
+    def model1(mass, alpha, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+    
+    primary_model = model1
+    
+    # if mass2 model has unique parameters, their names can be changed here
+    def model2(mass, beta, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, beta, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+    
+    secondary_model = model2
+
+    @property
+    def kwargs(self):
+        return dict(gaussian_mass_maximum=self.mmax)

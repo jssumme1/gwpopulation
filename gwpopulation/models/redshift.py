@@ -5,6 +5,7 @@ Implemented redshift models
 import numpy as xp
 
 from ..experimental.cosmo_models import CosmoMixin
+from ..utils import powerlaw
 
 __all__ = [
     "_Redshift",
@@ -292,3 +293,77 @@ def total_four_volume(lamb, analysis_time, max_redshift=2.3):
         * normalization
     )
     return total_volume
+
+
+class TimeDelayRedshift(_Redshift):
+
+    base_variable_names = ["kappa_d", "tau_min"]
+    
+    def time_delay(self, tau, **parameters):
+        kappa_d = parameters["kappa_d"]
+        tau_min = parameters["tau_min"]
+        
+        # if time delay is larger than age of universe, no merger would've happened yet
+        hubble_time = self.cosmology(parameters).hubble_time
+        
+        return powerlaw(tau, kappa_d, hubble_time, tau_min)
+            
+    def redshift_from_lookback_time(self, lookback_time, **parameters):
+        # cut out times that are too large
+        hubble_time = self.cosmology(parameters).hubble_time
+        lookback_time *= (lookback_time <= hubble_time)
+        
+        # need to numerically invert the lookback time to get the redshift
+        redshift_grid = xp.linspace(0, 100, 10000)
+        lookback_time = lookback_time[:, : ,xp.newaxis]
+        redshift_grid = redshift_grid[xp.newaxis, xp.newaxis, :]
+        lookback_time_broadcast = lookback_time * xp.ones(redshift_grid.shape)
+        redshift_grid_broadcast = redshift_grid * xp.ones(lookback_time.shape)
+        
+        # select the last time that is less than the target lookback time
+        # then index redshift from that time
+        times = self.cosmology(parameters).lookback_time(redshift_grid)
+        mask = (times <= lookback_time) & (times != 0)
+        closest_index = xp.count_nonzero(mask, axis=2, keepdims=True) - 1
+        closest_redshift = xp.take_along_axis(redshift_grid_broadcast, closest_index, axis=2)
+        return closest_redshift
+
+    def psi_of_z(self, redshift, **parameters):
+        r"""
+        Madau-Dickinson model convolved with a time delay distribution.
+
+        .. math::
+
+            \psi(z|\kappa_d, \tau_{\mathrm{min}}) \propto \int d \tau SFR(Z(t_{\mathrm{merge}}(z) + \tau)) p(\tau)
+            SFR(z) = \frac{(1 + z)^{2.7}{1 + (\frac{1 + z}{2.9})^{5.6}}
+            p(\tau) = \tau^{-\kappa_d} (0 \leq \tau \leq \tau_{\mathrm{min}})
+
+        Parameters
+        ----------
+        kappa_d: float
+            Slope of the power-law time delay distribution, :math:`\kappa_d`.
+        tau_min: float
+            Lower cutoff of the time delay distribution, :math:`\tau_{\mathrm{min}}`. (Gyr)
+        """
+        kappa_d = parameters["kappa_d"]
+        tau_min = parameters["tau_min"]
+        
+        hubble_time = self.cosmology(parameters).hubble_time
+        tau_grid = xp.linspace(tau_min, hubble_time, 2500)
+        
+        SFR = MadauDickinsonRedshift().psi_of_z(self.redshift_from_lookback_time(
+                        self.cosmology(parameters).lookback_time(redshift)[:, xp.newaxis] + tau_grid[xp.newaxis, :], **parameters), 
+                                              gamma=2.7, z_peak=1.9, kappa=5.6)
+        tau_probability = self.time_delay(tau_grid[xp.newaxis, :], **parameters)
+                       
+        psi_of_z = xp.trapz(SFR[:,:,0] * tau_probability, tau_grid, axis=1)
+        
+        # normalize it so psi(0) = 1
+        SFR_z0 = MadauDickinsonRedshift().psi_of_z(self.redshift_from_lookback_time(
+                        tau_grid[xp.newaxis, :], **parameters), 
+                                                   gamma=2.7, z_peak=1.9, kappa=5.6)
+        normalization = xp.trapz(SFR_z0[:,:,0] * tau_probability, tau_grid, axis=1)
+        
+        psi_of_z *= 1 / normalization
+        
+        return psi_of_z
