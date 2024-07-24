@@ -307,7 +307,17 @@ class TimeDelayRedshift(_Redshift):
         hubble_time = self.cosmology(parameters).hubble_time
         
         return powerlaw(tau, kappa_d, hubble_time, tau_min)
-            
+    
+    def inverse_cdf_time_delay(self, prob, **parameters):
+        kappa_d = parameters["kappa_d"]
+        tau_min = parameters["tau_min"]
+        hubble_time = self.cosmology(parameters).hubble_time
+        
+        if kappa_d != -1:
+            return (tau_min**(kappa_d+1) + prob * (hubble_time**(kappa_d+1) - tau_min**(kappa_d+1)))**(1/(kappa_d+1))
+        else:
+            return tau_min * xp.exp(prob * xp.log(hubble_time / tau_min))
+                    
     def redshift_from_lookback_time(self, lookback_time, **parameters):
         # cut out times that are too large
         hubble_time = self.cosmology(parameters).hubble_time

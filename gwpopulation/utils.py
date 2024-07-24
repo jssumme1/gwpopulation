@@ -129,6 +129,34 @@ def powerlaw(xx, alpha, high, low):
     prob *= (xx <= high) & (xx >= low)
     return prob
 
+@apply_conditions(dict(low=(ge, 0), alpha=(ne, 1)))
+def inverse_cdf_time_delay(prob, alpha, high, low):
+    r"""
+    Inverse cumumative distribution function of Power-law probability
+
+    Parameters
+    ----------
+    prob: float, array-like
+        The probability values from a CDF (:math:`p`)
+    alpha: float, array-like
+        The spectral index of the distribution (:math:`\alpha`)
+    high: float, array-like
+        The maximum of the distribution (:math:`x_\min`)
+    low: float, array-like
+        The minimum of the distribution (:math:`x_\max`)
+
+    Returns
+    -------
+    xx: float, array-like
+        The x value that corresponds to the given probability p
+
+    """    
+    alpha = xp.array(alpha)
+    xx = xp.where(alpha == -1, low * xp.exp(prob * xp.log(high / low)),
+                  (low**(alpha+1) + prob * (high**(alpha+1) - low**(alpha+1)))**(1/(alpha+1))
+                  )
+    return xx
+
 
 @apply_conditions(dict(sigma=(gt, 0)))
 def truncnorm(xx, mu, sigma, high, low):
