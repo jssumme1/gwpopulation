@@ -7,6 +7,11 @@ import numpy as xp
 from ..experimental.cosmo_models import CosmoMixin
 from ..utils import powerlaw, inverse_cdf_time_delay
 
+try:
+    from jax import random
+except ImportError:
+    pass
+
 __all__ = [
     "_Redshift",
     "PowerLawRedshift",
@@ -302,11 +307,7 @@ class TimeDelayRedshift(_Redshift):
     def time_delay(self, tau, **parameters):
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
-        
-        # if time delay is larger than age of universe, no merger would've happened yet
-        hubble_time = self.cosmology(parameters).hubble_time
-        
-        return powerlaw(tau, kappa_d, hubble_time, tau_min)
+        return powerlaw(tau, kappa_d, self.hubble_time, tau_min)
     
     def MadauDickinson_SFR(self, redshift):
         gamma = 2.7
@@ -318,29 +319,15 @@ class TimeDelayRedshift(_Redshift):
         )
         psi_of_z *= 1 + (1 + z_peak) ** (-kappa)
         return psi_of_z
-    
-    def inverse_cdf_time_delay(self, prob, **parameters):
-        kappa_d = parameters["kappa_d"]
-        tau_min = parameters["tau_min"]
-        hubble_time = self.cosmology(parameters).hubble_time
-        
-        if kappa_d != -1:
-            return (tau_min**(kappa_d+1) + prob * (hubble_time**(kappa_d+1) - tau_min**(kappa_d+1)))**(1/(kappa_d+1))
-        else:
-            return tau_min * xp.exp(prob * xp.log(hubble_time / tau_min))
-                    
-    def redshift_from_lookback_time(self, lookback_time, **parameters):
-        # save redshift grid and lookback time grid
-        if not hasattr(self, 'redshift_grid'):
-            self.redshift_grid = xp.logspace(-5, 3, 10000)
-        if not hasattr(self, 'lookback_time_grid'):
-            self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
-
-        hubble_time = self.cosmology(parameters).hubble_time
-        lookback_time *= (lookback_time <= hubble_time)
+                        
+    def redshift_from_lookback_time(self, lookback_time):
+        lookback_time *= (lookback_time <= self.hubble_time)
         z = xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid)
-        
         return z
+    
+    def lookback_time_from_redshift(self, redshift):
+        lookback_time = xp.interp(redshift, self.redshift_grid, self.lookback_time_grid)
+        return lookback_time
         
     def psi_of_z(self, redshift, num_samples=10000, **parameters):
         r"""
@@ -361,17 +348,30 @@ class TimeDelayRedshift(_Redshift):
         """
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
-        hubble_time = self.cosmology(parameters).hubble_time
+        if not hasattr(self, 'hubble_time'):
+            self.hubble_time = self.cosmology(parameters).hubble_time
+            
+        # save redshift grid and lookback time grid
+        if not hasattr(self, 'redshift_grid'):
+            self.redshift_grid = xp.logspace(-5, 3, 10000)
+        if not hasattr(self, 'lookback_time_grid'):
+            self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
         
         # add zero to front for normalization
         redshift = xp.append(0, redshift)
         
-        rng = xp.random.default_rng()
-        #num_samples = int(1e4)
-        tau_samples = inverse_cdf_time_delay(rng.random(num_samples), kappa_d, tau_min, hubble_time)
+        try:
+            rng = xp.random.default_rng()
+            uniform_samples = rng.random(num_samples)
+        except AttributeError:
+            key = random.PRNGKey(758493)
+            uniform_samples = random.uniform(key, shape=(num_samples,))
+        
+        merger_lookback_time = self.lookback_time_from_redshift(redshift)
+        tau_samples = inverse_cdf_time_delay(uniform_samples[xp.newaxis, :], 
+                                             kappa_d, tau_min, self.hubble_time - merger_lookback_time[:, xp.newaxis])
 
-        SFR = self.MadauDickinson_SFR(self.redshift_from_lookback_time(
-                    self.cosmology(parameters).lookback_time(redshift)[:, xp.newaxis] + tau_samples[xp.newaxis, :], **parameters))
+        SFR = self.MadauDickinson_SFR(self.redshift_from_lookback_time(merger_lookback_time[:, xp.newaxis] + tau_samples))
                 
         psi_of_z = xp.sum(SFR, axis=1) / num_samples
         
