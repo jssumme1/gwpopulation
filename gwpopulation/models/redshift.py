@@ -7,11 +7,6 @@ import numpy as xp
 from ..experimental.cosmo_models import CosmoMixin
 from ..utils import powerlaw, inverse_cdf_time_delay
 
-try:
-    from jax import random
-except ImportError:
-    pass
-
 __all__ = [
     "_Redshift",
     "PowerLawRedshift",
@@ -321,8 +316,10 @@ class TimeDelayRedshift(_Redshift):
         return psi_of_z
                         
     def redshift_from_lookback_time(self, lookback_time):
-        lookback_time *= (lookback_time <= self.hubble_time)
-        z = xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid)
+        #z = xp.where(lookback_time <= self.hubble_time,
+        #             xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid),
+        #             -1 * xp.ones(lookback_time.shape))
+        z = xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid, left=0, right=-1)
         return z
     
     def lookback_time_from_redshift(self, redshift):
@@ -346,6 +343,9 @@ class TimeDelayRedshift(_Redshift):
         tau_min: float
             Lower cutoff of the time delay distribution, :math:`\tau_{\mathrm{min}}`. (Gyr)
         """
+        if "jax" in xp.__name__:
+            from jax import random
+        
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
         if not hasattr(self, 'hubble_time'):
@@ -353,26 +353,36 @@ class TimeDelayRedshift(_Redshift):
             
         # save redshift grid and lookback time grid
         if not hasattr(self, 'redshift_grid'):
-            self.redshift_grid = xp.logspace(-5, 3, 10000)
+            self.redshift_grid = xp.logspace(-3, 1.2, 1000)
         if not hasattr(self, 'lookback_time_grid'):
             self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
         
         # add zero to front for normalization
         redshift = xp.append(0, redshift)
         
-        try:
-            rng = xp.random.default_rng()
-            uniform_samples = rng.random(num_samples)
-        except AttributeError:
-            key = random.PRNGKey(758493)
-            uniform_samples = random.uniform(key, shape=(num_samples,))
+        if hasattr(self, 'uniform_samples'):
+            if len(self.uniform_samples) != num_samples:
+                draw_samples = True
+            else:
+                draw_samples = False
+        else:
+            draw_samples = True
+            
+        if draw_samples == True:
+            if "jax" not in xp.__name__:
+                rng = xp.random.default_rng()
+                self.uniform_samples = rng.random(int(num_samples))
+            else:
+                key = random.PRNGKey(758493)
+                self.uniform_samples = random.uniform(key, shape=(int(num_samples),))
         
         merger_lookback_time = self.lookback_time_from_redshift(redshift)
-        tau_samples = inverse_cdf_time_delay(uniform_samples[xp.newaxis, :], 
+        tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, :], 
                                              kappa_d, tau_min, self.hubble_time - merger_lookback_time[:, xp.newaxis])
 
-        SFR = self.MadauDickinson_SFR(self.redshift_from_lookback_time(merger_lookback_time[:, xp.newaxis] + tau_samples))
-                
+        z_form = self.redshift_from_lookback_time(merger_lookback_time[:, xp.newaxis] + tau_samples)
+        SFR = xp.where(z_form != -1, self.MadauDickinson_SFR(z_form), xp.zeros(z_form.shape))    
+            
         psi_of_z = xp.sum(SFR, axis=1) / num_samples
         
         # normalize it
