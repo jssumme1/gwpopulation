@@ -1154,3 +1154,84 @@ class SinglePeakIndependentSmoothedPrimarySecondaryDistribution(BaseSmoothedPrim
     @property
     def kwargs(self):
         return dict(gaussian_mass_maximum=self.mmax)
+
+    
+def two_component_single_evo_alpha(
+    mass, redshift, alpha, mmin, mmax, lam, mpp, sigpp, wz, gaussian_mass_maximum=100
+):
+    r"""
+    Power law model for one-dimensional mass distribution with a Gaussian component.
+    Power law spectral index made to evolve with redshift.
+
+    .. math::
+        p(m) &= (1 - \lambda_m) p_{\text{pow}} + \lambda_m p_{\text{norm}}
+
+        p_{\text{pow}}(m) &\propto m^{-\alpha + wz} : m_\min \leq m < m_\max
+
+        p_{\text{norm}}(m) &\propto \exp\left(-\frac{(m - \mu_{m})^2}{2\sigma^2_m}\right)
+
+    Parameters
+    ----------
+    mass: array-like
+        Array of mass values (:math:`m`).
+    alpha: float
+        Negative power law exponent for the black hole distribution (:math:`\alpha`).
+    mmin: float
+        Minimum black hole mass (:math:`m_\min`).
+    mmax: float
+        Maximum black hole mass (:math:`m_\max`).
+    lam: float
+        Fraction of black holes in the Gaussian component (:math:`\lambda_m`).
+    mpp: float
+        Mean of the Gaussian component (:math:`\mu_m`).
+    sigpp: float
+        Standard deviation of the Gaussian component (:math:`\sigma_m`).
+    wz: float
+        slope of redshift evolution in power law index (:math:`w_z`).
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    """
+    p_pow = powerlaw(mass, alpha=-alpha + wz*redshift, high=mmax, low=mmin)
+    p_norm = truncnorm(mass, mu=mpp, sigma=sigpp, high=gaussian_mass_maximum, low=mmin)
+    prob = (1 - lam) * p_pow + lam * p_norm
+    return prob
+
+class PowerlawPeakEvoAlpha(BaseSmoothedMassDistribution):
+    """
+    Powerlaw + peak model for two-dimensional mass distribution with low
+    mass smoothing.
+
+    https://arxiv.org/abs/1801.02699 Eq. (11) (T&T18)
+
+    Parameters
+    ----------
+    dataset: dict
+        Dictionary of numpy arrays for 'mass_1' and 'mass_ratio'.
+    alpha: float
+        Powerlaw exponent for more massive black hole.
+    beta: float
+        Power law exponent of the mass ratio distribution.
+    mmin: float
+        Minimum black hole mass.
+    mmax: float
+        Maximum mass in the powerlaw distributed component.
+    lam: float
+        Fraction of black holes in the Gaussian component.
+    mpp: float
+        Mean of the Gaussian component.
+    sigpp: float
+        Standard deviation of the Gaussian component.
+    delta_m: float
+        Rise length of the low end of the mass distribution.
+
+    Notes
+    -----
+    The Gaussian component is bounded between [`mmin`, `self.mmax`].
+    This means that the `mmax` parameter is _not_ the global maximum.
+    """
+
+    primary_model = two_component_single_evo_alpha
+
+    @property
+    def kwargs(self):
+        return dict(gaussian_mass_maximum=self.mmax)

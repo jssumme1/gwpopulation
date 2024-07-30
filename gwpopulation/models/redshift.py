@@ -294,7 +294,6 @@ def total_four_volume(lamb, analysis_time, max_redshift=2.3):
     )
     return total_volume
 
-
 class TimeDelayRedshift(_Redshift):
 
     base_variable_names = ["kappa_d", "tau_min"]
@@ -316,9 +315,6 @@ class TimeDelayRedshift(_Redshift):
         return psi_of_z
                         
     def redshift_from_lookback_time(self, lookback_time):
-        #z = xp.where(lookback_time <= self.hubble_time,
-        #             xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid),
-        #             -1 * xp.ones(lookback_time.shape))
         z = xp.interp(lookback_time, self.lookback_time_grid, self.redshift_grid, left=0, right=-1)
         return z
     
@@ -326,7 +322,7 @@ class TimeDelayRedshift(_Redshift):
         lookback_time = xp.interp(redshift, self.redshift_grid, self.lookback_time_grid)
         return lookback_time
         
-    def psi_of_z(self, redshift, num_samples=10000, **parameters):
+    def psi_of_z(self, redshift, num_samples=50, **parameters):
         r"""
         Madau-Dickinson model convolved with a time delay distribution.
 
@@ -345,6 +341,9 @@ class TimeDelayRedshift(_Redshift):
         """
         if "jax" in xp.__name__:
             from jax import random
+            
+        shape = redshift.shape
+        redshift = redshift.ravel()
         
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
@@ -387,5 +386,7 @@ class TimeDelayRedshift(_Redshift):
         
         # normalize it
         psi_of_z = psi_of_z[1:] / psi_of_z[0]
+        
+        psi_of_z = psi_of_z.reshape(shape)
         
         return psi_of_z
