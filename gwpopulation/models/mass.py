@@ -1199,9 +1199,7 @@ def two_component_single_evo_alpha(
 class PowerlawPeakEvoAlpha(BaseSmoothedMassDistribution):
     """
     Powerlaw + peak model for two-dimensional mass distribution with low
-    mass smoothing.
-
-    https://arxiv.org/abs/1801.02699 Eq. (11) (T&T18)
+    mass smoothing and evolving with redshift
 
     Parameters
     ----------
@@ -1221,6 +1219,8 @@ class PowerlawPeakEvoAlpha(BaseSmoothedMassDistribution):
         Mean of the Gaussian component.
     sigpp: float
         Standard deviation of the Gaussian component.
+    wz: float
+        slope of redshift evolution in power law index (:math:`w_z`).
     delta_m: float
         Rise length of the low end of the mass distribution.
 
@@ -1231,6 +1231,44 @@ class PowerlawPeakEvoAlpha(BaseSmoothedMassDistribution):
     """
 
     primary_model = two_component_single_evo_alpha
+    
+    @property
+    def variable_names(self):
+        vars = getattr(
+            self.primary_model,
+            "variable_names",
+            inspect.getfullargspec(self.primary_model).args[2:],
+        )
+        vars += ["beta", "delta_m"]
+        vars = set(vars).difference(self.kwargs.keys())
+        return vars
+
+    def p_m1(self, dataset, **kwargs):
+        mmin = kwargs.get("mmin", self.mmin)
+        delta_m = kwargs.pop("delta_m", 0)
+        p_m = self.__class__.primary_model(dataset["mass_1"], dataset['redshift'], **kwargs)
+        p_m *= self.smoothing(
+            dataset["mass_1"], mmin=mmin, mmax=self.mmax, delta_m=delta_m
+        )
+        norm = self.norm_p_m1(dataset['redshift'], delta_m=delta_m, **kwargs)
+        return p_m / norm
+
+    def norm_p_m1(self, redshifts, delta_m, **kwargs):
+        """Calculate the normalisation factor for the primary mass"""
+        mmin = kwargs.get("mmin", self.mmin)
+        if "jax" not in xp.__name__ and delta_m == 0:
+            return 1
+        # broadcast them because we want to normalize for each specific redshift
+        p_m = self.__class__.primary_model(self.m1s[..., xp.newaxis], redshifts[xp.newaxis, ...] , **kwargs)
+        # smoothing does not depend on alpha nor z
+        p_m *= self.smoothing(self.m1s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
+
+        # this *should* result in a 1D array that associates each z to a norm
+        norm = xp.nan_to_num(xp.trapz(p_m, self.m1s, axis=0)) * (delta_m != 0) + 1 * (
+            delta_m == 0
+        )
+        return norm
+
 
     @property
     def kwargs(self):

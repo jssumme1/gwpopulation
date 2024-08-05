@@ -3,6 +3,7 @@ Implemented redshift models
 """
 
 import numpy as xp
+import scipy.special as scs
 
 from ..experimental.cosmo_models import CosmoMixin
 from ..utils import powerlaw, inverse_cdf_time_delay
@@ -294,6 +295,7 @@ def total_four_volume(lamb, analysis_time, max_redshift=2.3):
     )
     return total_volume
 
+
 class TimeDelayRedshift(_Redshift):
 
     base_variable_names = ["kappa_d", "tau_min"]
@@ -321,8 +323,11 @@ class TimeDelayRedshift(_Redshift):
     def lookback_time_from_redshift(self, redshift):
         lookback_time = xp.interp(redshift, self.redshift_grid, self.lookback_time_grid)
         return lookback_time
+    
+    def integrand(self, x, redshift, **parameters):
+        return x
         
-    def psi_of_z(self, redshift, num_samples=50, **parameters):
+    def psi_of_z(self, redshift, num_samples=5000, **parameters):
         r"""
         Madau-Dickinson model convolved with a time delay distribution.
 
@@ -341,24 +346,18 @@ class TimeDelayRedshift(_Redshift):
         """
         if "jax" in xp.__name__:
             from jax import random
-            
-        shape = redshift.shape
-        redshift = redshift.ravel()
-        
+                    
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
         if not hasattr(self, 'hubble_time'):
-            self.hubble_time = self.cosmology(parameters).hubble_time
+            self.hubble_time = self.cosmology(parameters).hubble_time.value
             
         # save redshift grid and lookback time grid
         if not hasattr(self, 'redshift_grid'):
-            self.redshift_grid = xp.logspace(-3, 1.2, 1000)
+            self.redshift_grid = xp.logspace(-3, 1.2, 10000)
         if not hasattr(self, 'lookback_time_grid'):
             self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
-        
-        # add zero to front for normalization
-        redshift = xp.append(0, redshift)
-        
+                
         if hasattr(self, 'uniform_samples'):
             if len(self.uniform_samples) != num_samples:
                 draw_samples = True
@@ -374,19 +373,90 @@ class TimeDelayRedshift(_Redshift):
             else:
                 key = random.PRNGKey(758493)
                 self.uniform_samples = random.uniform(key, shape=(int(num_samples),))
-        
+                        
         merger_lookback_time = self.lookback_time_from_redshift(redshift)
-        tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, :], 
-                                             kappa_d, tau_min, self.hubble_time - merger_lookback_time[:, xp.newaxis])
+        tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, ...], 
+                                             kappa_d, tau_min, self.hubble_time - merger_lookback_time[..., xp.newaxis])
+        t_form = merger_lookback_time[..., xp.newaxis] + tau_samples
+        
+        ns = 30 # number of slices
+        ss = int(t_form.shape[0]/10) # size of slice
+        for ii in range(ns):
+            if ii == 0:
+                z_form = self.redshift_from_lookback_time(t_form[0:ss,...])
+            elif ii == ns-1:
+                z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):,...])), axis=0)
+            else:
+                z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):(ii*ss+ss),...])), axis=0)
 
-        z_form = self.redshift_from_lookback_time(merger_lookback_time[:, xp.newaxis] + tau_samples)
         SFR = xp.where(z_form != -1, self.MadauDickinson_SFR(z_form), xp.zeros(z_form.shape))    
-            
-        psi_of_z = xp.sum(SFR, axis=1) / num_samples
+        weighted_SFR = self.integrand(SFR, z_form, **parameters)    
+        
+        psi_of_z = xp.sum(weighted_SFR, axis=-1) / num_samples
         
         # normalize it
-        psi_of_z = psi_of_z[1:] / psi_of_z[0]
-        
-        psi_of_z = psi_of_z.reshape(shape)
+        psi_of_z /= self.normalize_psi(num_samples = num_samples, **parameters)        
         
         return psi_of_z
+
+    def normalize_psi(self, num_samples=1000, **parameters):
+        r'''
+        The normalized version of psi_of_z can be obtained by
+        psi_of_z / normalize_psi
+        '''
+        kappa_d = parameters["kappa_d"]
+        tau_min = parameters["tau_min"]
+        tau_samples = inverse_cdf_time_delay(self.uniform_samples, 
+                                             kappa_d, tau_min, self.hubble_time)
+        t_form = tau_samples
+        z_form = self.redshift_from_lookback_time(t_form)
+        SFR = self.MadauDickinson_SFR(z_form)  
+        # broadcast for safety in case metallicity weight is included
+        weighted_SFR = self.integrand(SFR, z_form, **parameters)
+        psi_of_z = xp.sum(weighted_SFR, axis=-1) / num_samples
+                        
+        return psi_of_z
+
+
+class HeavisideRedshift(_Redshift):
+    base_variable_names = ["zmin", "zmax"]
+
+    def psi_of_z(self, redshift, **parameters):
+        r"""
+        Heaviside function redshift
+        
+        .. math::
+        
+            \psi(z|z_{\rm min}, z_{\rm max}) = H(z-z_{\rm min}) - H(z - z_{\rm max})
+
+        Parameters
+        ----------
+        zmin: float
+            minimum value of redhisft, :math:`z_{\rm min}`.
+        zmax: float
+            maximum value of redshift, :math:`z_{\rm max}`.
+        """
+        return xp.ones(redshift.shape) * (redshift >= parameters["zmin"]) * (redshift <= parameters["zmax"])
+
+class MadauDickinsonHeavisideRedshift(MadauDickinsonRedshift):
+    def psi_of_z(self, redshift, **parameters):
+        zmin = parameters["zmin"]
+        zmax = parameters["zmax"]
+        
+        full_psi_of_z = super().psi_of_z(redshift, **parameters)
+        return full_psi_of_z * (redshift >= zmin) * (redshift <= zmax)
+    
+class TimeDelayHeavisideRedshift(TimeDelayRedshift):
+    def psi_of_z(self, redshift, num_samples=5000, **parameters):
+        zmin = parameters["zmin"]
+        zmax = parameters["zmax"]
+        
+        full_psi_of_z = super().psi_of_z(redshift, num_samples=num_samples, **parameters)
+        return full_psi_of_z * (redshift >= zmin) * (redshift <= zmax)
+    
+
+class MetallicityWeightedTimeDelayRedshift(TimeDelayRedshift):
+    def integrand(self, x, redshift, **parameters):
+        Zmax = parameters["Zmax"] # Z / Z_sun
+        frac_star_formation =  scs.gammainc(0.84, Zmax**2 * 10**(0.3 * redshift)) / 1.122
+        return x * frac_star_formation
