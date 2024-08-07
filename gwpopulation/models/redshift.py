@@ -350,18 +350,16 @@ class TimeDelayRedshift(_Redshift):
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
         if not hasattr(self, 'hubble_time'):
-            self.hubble_time = self.cosmology(parameters).hubble_time.value
-            self.hubble_time = 13.5
+            #self.hubble_time = self.cosmology(parameters).hubble_time.value
+            self.hubble_time = self.cosmology(parameters).lookback_time(100)
             
         # save redshift grid and lookback time grid
         if not hasattr(self, 'redshift_grid'):
-            #self.redshift_grid = xp.logspace(-3, 1.2, 10000)
-            self.redshift_grid = xp.logspace(-3, 3, 10000)
+            self.redshift_grid = xp.logspace(-3, 2, 10000)
         if not hasattr(self, 'lookback_time_grid'):
             self.lookback_time_grid = self.cosmology(parameters).lookback_time(self.redshift_grid)
-            # added this
-            #self.lookback_time_grid = xp.where(self.lookback_time_grid < self.hubble_time, self.lookback_time_grid, 0)
                 
+        # draw the samples once and save them
         if hasattr(self, 'uniform_samples'):
             if len(self.uniform_samples) != num_samples:
                 draw_samples = True
@@ -379,26 +377,24 @@ class TimeDelayRedshift(_Redshift):
                 self.uniform_samples = random.uniform(key, shape=(int(num_samples),))
                         
         merger_lookback_time = self.lookback_time_from_redshift(redshift)
-        #tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, ...], 
-        #                                     kappa_d, self.hubble_time - merger_lookback_time[..., xp.newaxis], tau_min)
-        tau_samples = inverse_cdf_time_delay(self.uniform_samples, kappa_d, self.hubble_time, tau_min)
-        t_form = merger_lookback_time[..., xp.newaxis] + tau_samples
-        z_form = self.redshift_from_lookback_time(t_form)
+        tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, ...], 
+                                             kappa_d, self.hubble_time - merger_lookback_time[..., xp.newaxis], tau_min)
+        t_form = merger_lookback_time[..., xp.newaxis] + tau_samples        
         
-        '''
+        # calculate z_form incrementally. jax dies if a large array is interpolated all at once.
         ns = 30 # number of slices
         ss = int(t_form.shape[0]/ns) # size of slice
         for ii in range(ns):
-            if ii == 0:
+            if ii == 0: # first slice
                 z_form = self.redshift_from_lookback_time(t_form[0:ss,...])
-            elif ii == ns-1:
+            elif ii == ns-1: # last slice
                 z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):,...])), axis=0)
-            else:
+            else: # intermediate slices
                 z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):(ii*ss+ss),...])), axis=0)
-        '''
-
-        z_form = xp.where(z_form < 10, z_form, -1)
+        
+        # calculat SFR, eliminating values with lookback time > hubble time 
         SFR = xp.where(z_form != -1, self.MadauDickinson_SFR(z_form), xp.zeros(z_form.shape))
+        # adds in metallicity dependence, if relevant
         weighted_SFR = self.integrand(SFR, z_form, **parameters)    
         
         psi_of_z = xp.sum(weighted_SFR, axis=-1) / num_samples
@@ -408,15 +404,14 @@ class TimeDelayRedshift(_Redshift):
         
         return psi_of_z
 
-    def normalize_psi(self, num_samples=1000, **parameters):
+    def normalize_psi(self, num_samples=5000, **parameters):
         r'''
         The normalized version of psi_of_z can be obtained by
         psi_of_z / normalize_psi
         '''
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
-        tau_samples = inverse_cdf_time_delay(self.uniform_samples, 
-                                             kappa_d, self.hubble_time, tau_min)
+        tau_samples = inverse_cdf_time_delay(self.uniform_samples, kappa_d, self.hubble_time, tau_min)
         t_form = tau_samples
         z_form = self.redshift_from_lookback_time(t_form)
         SFR = self.MadauDickinson_SFR(z_form)  
