@@ -300,6 +300,15 @@ class TimeDelayRedshift(_Redshift):
 
     base_variable_names = ["kappa_d", "tau_min"]
     
+    def set_max_redshift(self, z):
+        self.max_redshift = z
+        
+    def set_fast(self, boolean):
+        self.fast = boolean
+        
+    def set_num_samples(self, n):
+        self.num_samples = int(n)
+    
     def time_delay(self, tau, **parameters):
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
@@ -327,7 +336,7 @@ class TimeDelayRedshift(_Redshift):
     def integrand(self, x, redshift, **parameters):
         return x
         
-    def psi_of_z(self, redshift, num_samples=5000, **parameters):
+    def psi_of_z(self, redshift, num_samples=5000, max_redshift=1000, fast=True, **parameters):
         r"""
         Madau-Dickinson model convolved with a time delay distribution.
 
@@ -346,6 +355,16 @@ class TimeDelayRedshift(_Redshift):
         """
         if "jax" in xp.__name__:
             from jax import random
+            
+        print(redshift.shape)
+            
+        # allow these to be changed for popstock
+        if hasattr(self, 'max_redshift'):
+            max_redshift = self.max_redshift
+        if hasattr(self, 'fast'):
+            fast = self.fast
+        if hasattr(self, 'num_samples'):
+            num_samples = self.num_samples
                     
         kappa_d = parameters["kappa_d"]
         tau_min = parameters["tau_min"]
@@ -377,10 +396,16 @@ class TimeDelayRedshift(_Redshift):
                 self.uniform_samples = random.uniform(key, shape=(int(num_samples),))
                         
         merger_lookback_time = self.lookback_time_from_redshift(redshift)
-        tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, ...], 
-                                             kappa_d, self.hubble_time - merger_lookback_time[..., xp.newaxis], tau_min)
-        t_form = merger_lookback_time[..., xp.newaxis] + tau_samples        
         
+        if fast == False:
+            tau_samples = inverse_cdf_time_delay(self.uniform_samples[xp.newaxis, ...], 
+                                                 kappa_d, self.hubble_time - merger_lookback_time[..., xp.newaxis], tau_min)
+            t_form = merger_lookback_time[..., xp.newaxis] + tau_samples    
+                            
+        else:
+            tau_samples = inverse_cdf_time_delay(self.uniform_samples, kappa_d, self.hubble_time, tau_min)
+            t_form = merger_lookback_time[..., xp.newaxis] + tau_samples[xp.newaxis, ...]
+
         # calculate z_form incrementally. jax dies if a large array is interpolated all at once.
         ns = 30 # number of slices
         ss = int(t_form.shape[0]/ns) # size of slice
@@ -391,9 +416,11 @@ class TimeDelayRedshift(_Redshift):
                 z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):,...])), axis=0)
             else: # intermediate slices
                 z_form = xp.concatenate((z_form, self.redshift_from_lookback_time(t_form[(ii*ss):(ii*ss+ss),...])), axis=0)
-        
-        # calculat SFR, eliminating values with lookback time > hubble time 
+
+            
+        # calculate SFR, eliminating values with lookback time > hubble time 
         SFR = xp.where(z_form != -1, self.MadauDickinson_SFR(z_form), xp.zeros(z_form.shape))
+        SFR = xp.where(z_form <= max_redshift, SFR, 0)
         # adds in metallicity dependence, if relevant
         weighted_SFR = self.integrand(SFR, z_form, **parameters)    
         
@@ -404,7 +431,7 @@ class TimeDelayRedshift(_Redshift):
         
         return psi_of_z
 
-    def normalize_psi(self, num_samples=5000, **parameters):
+    def normalize_psi(self, num_samples=5000, max_redshift=1000, **parameters):
         r'''
         The normalized version of psi_of_z can be obtained by
         psi_of_z / normalize_psi
@@ -415,6 +442,7 @@ class TimeDelayRedshift(_Redshift):
         t_form = tau_samples
         z_form = self.redshift_from_lookback_time(t_form)
         SFR = self.MadauDickinson_SFR(z_form)  
+        SFR = xp.where(z_form <= max_redshift, SFR, 0)
         # broadcast for safety in case metallicity weight is included
         weighted_SFR = self.integrand(SFR, z_form, **parameters)
         psi_of_z = xp.sum(weighted_SFR, axis=-1) / num_samples
@@ -443,6 +471,8 @@ class HeavisideRedshift(_Redshift):
         return xp.ones(redshift.shape) * (redshift >= parameters["zmin"]) * (redshift <= parameters["zmax"])
 
 class MadauDickinsonHeavisideRedshift(MadauDickinsonRedshift):
+    base_variable_names = ["gamma", "z_peak", "kappa", "zmin", "zmax"]
+    
     def psi_of_z(self, redshift, **parameters):
         zmin = parameters["zmin"]
         zmax = parameters["zmax"]
@@ -460,7 +490,63 @@ class TimeDelayHeavisideRedshift(TimeDelayRedshift):
     
 
 class MetallicityWeightedTimeDelayRedshift(TimeDelayRedshift):
+    base_variable_names = ["kappa_d", "tau_min", "Zmax"]
     def integrand(self, x, redshift, **parameters):
         Zmax = parameters["Zmax"] # Z / Z_sun
         frac_star_formation =  scs.gammainc(0.84, Zmax**2 * 10**(0.3 * redshift)) / 1.122
         return x * frac_star_formation
+    
+
+class MadauDickinsonSwitchRedshift(_Redshift):
+
+    base_variable_names = ["gamma", "kappa", "z_peak", "eta", "z_turn", "boost"]
+
+    def psi_of_z(self, redshift, **parameters):
+        r"""
+        Redshift model from Fishbach+
+        (`arXiv:1805.10270 <https://arxiv.org/abs/1805.10270>`_ Eq. (33))
+        See Callister+ (`arXiv:2003.12152 <https://arxiv.org/abs/2003.12152>`_
+        Eq. (2)) for the normalisation.
+
+        .. math::
+
+            \psi(z|\gamma, \kappa, z_p) = \frac{(1 + z)^\gamma}{1 + (\frac{1 + z}{1 + z_p})^\kappa}
+
+        Parameters
+        ----------
+        gamma: float
+            Slope of the distribution at low redshift, :math:`\gamma`.
+        kappa: float
+            Slope of the distribution at high redshift, :math:`\kappa`.
+        z_peak: float
+            Redshift at which the distribution peaks, :math:`z_p`.
+        z_turn: float
+            Redshift at which power law slope changes to eta
+        eta: float
+            high-redshift power law slope
+        boost: float
+            multiplicative factor applied to high-z merger rate
+        """
+        gamma = parameters["gamma"]
+        kappa = parameters["kappa"]
+        z_peak = parameters["z_peak"]
+        z_turn = parameters["z_turn"]
+        eta = parameters["eta"]
+        boost = parameters["boost"]
+        
+        MDR = (1 + redshift) ** gamma / (
+            1 + ((1 + redshift) / (1 + z_peak)) ** kappa
+        ) * (1 + (1 + z_peak) ** (-kappa))
+        
+        highz = (1 + redshift) ** eta
+        
+        match1 = (1 + z_turn) ** gamma / (
+            1 + ((1 + z_turn) / (1 + z_peak)) ** kappa
+        ) * (1 + (1 + z_peak) ** (-kappa))
+        match2 = (1 + z_turn) ** eta
+        
+        highz *= match1 / match2 * boost
+        
+        psi_of_z = MDR * (redshift <= z_turn) + highz * (redshift > z_turn)
+        
+        return psi_of_z

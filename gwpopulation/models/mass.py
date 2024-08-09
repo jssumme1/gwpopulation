@@ -1259,17 +1259,109 @@ class PowerlawPeakEvoAlpha(BaseSmoothedMassDistribution):
         if "jax" not in xp.__name__ and delta_m == 0:
             return 1
         # broadcast them because we want to normalize for each specific redshift
+        z_shape = redshifts.shape
+        redshifts = redshifts.ravel()
         p_m = self.__class__.primary_model(self.m1s[..., xp.newaxis], redshifts[xp.newaxis, ...] , **kwargs)
         # smoothing does not depend on alpha nor z
-        p_m *= self.smoothing(self.m1s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
+        p_m *= self.smoothing(self.m1s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)[..., xp.newaxis]
 
         # this *should* result in a 1D array that associates each z to a norm
         norm = xp.nan_to_num(xp.trapz(p_m, self.m1s, axis=0)) * (delta_m != 0) + 1 * (
             delta_m == 0
         )
-        return norm
-
+        return norm.reshape(z_shape)
 
     @property
     def kwargs(self):
         return dict(gaussian_mass_maximum=self.mmax)
+
+
+def pp_gc_mixture_model(mass, redshift, alpha, mmin, mmax, lam, mpp, sigpp, 
+                        g_1, g_2, z_turn, dz, gaussian_mass_maximum=100):
+    r"""
+    Mixture model for a smoothed power-law+peak as well as a broken power-law to
+    model globular cluster dynamical interactions.
+
+    Parameters
+    ----------
+    mass: array-like
+        Array of mass values (:math:`m`).
+    redshift: array-like
+        Array of redshift values
+    alpha: float
+        Negative power law exponent for the black hole distribution (:math:`\alpha`).
+    mmin: float
+        Minimum black hole mass (:math:`m_\min`).
+    mmax: float
+        Maximum black hole mass (:math:`m_\max`).
+    lam: float
+        Fraction of black holes in the Gaussian component (:math:`\lambda_m`).
+    mpp: float
+        Mean of the Gaussian component (:math:`\mu_m`).
+    sigpp: float
+        Standard deviation of the Gaussian component (:math:`\sigma_m`).
+    g_1: float
+        Power law index of low-mass GC BH contribution
+    g_2: float
+        Power law index of high-mass GC BH contribution
+    zturn: float
+        Center of the switch between PP dominance and GC dominance
+    dz: float
+        Width of logistic switch to GC from PP
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    """
+    
+    PP = two_component_single(mass, alpha, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+    
+    # power law break corresponds to peak
+    break_fraction = (mpp - mmin) / (mmax - mmin)
+    GC = double_power_law_primary_mass(mass, g_1, g_2, mmin, mmax, break_fraction)
+    
+    # fractional PP contribution
+    shifted = (z_turn-redshift)/dz
+    zeta = scs.expit(shifted)
+    
+    prob = (1 - zeta) * GC + zeta * PP
+    
+    return prob
+
+class MixturePowerPeakEvoCluster(PowerlawPeakEvoAlpha):
+    r"""
+    Mixture model for a smoothed power-law+peak as well as a broken power-law to
+    model globular cluster dynamical interactions.
+
+    Parameters
+    ----------
+    dataset: dict
+        Dictionary of numpy arrays for 'mass_1', 'mass_ratio', and 'redshift'.
+    alpha: float
+        Negative power law exponent for the black hole distribution (:math:`\alpha`).
+    beta: float
+        Power law exponent of the mass ratio distribution.
+    mmin: float
+        Minimum black hole mass (:math:`m_\min`).
+    mmax: float
+        Maximum black hole mass (:math:`m_\max`).
+    lam: float
+        Fraction of black holes in the Gaussian component (:math:`\lambda_m`).
+    mpp: float
+        Mean of the Gaussian component (:math:`\mu_m`).
+    sigpp: float
+        Standard deviation of the Gaussian component (:math:`\sigma_m`).
+    g_1: float
+        Power law index of low-mass GC BH contribution
+    g_2: float
+        Power law index of high-mass GC BH contribution
+    z_turn: float
+        Center of the switch between PP dominance and GC dominance
+    dz: float
+        Width of logistic switch to GC from PP
+    delta_m: float
+        Rise length of the low end of the mass distribution.
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    """
+
+    primary_model = pp_gc_mixture_model
