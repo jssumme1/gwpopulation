@@ -355,9 +355,7 @@ class TimeDelayRedshift(_Redshift):
         """
         if "jax" in xp.__name__:
             from jax import random
-            
-        print(redshift.shape)
-            
+                        
         # allow these to be changed for popstock
         if hasattr(self, 'max_redshift'):
             max_redshift = self.max_redshift

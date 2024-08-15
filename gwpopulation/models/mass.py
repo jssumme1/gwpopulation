@@ -1365,3 +1365,325 @@ class MixturePowerPeakEvoCluster(PowerlawPeakEvoAlpha):
     """
 
     primary_model = pp_gc_mixture_model
+
+    
+
+class BaseSmoothedPairedDistribution(BaseSmoothedMassDistribution):
+    """
+    Generic smoothed mass (m1 and m2) distribution base class.
+    Alternative to BaseSmoothedMassDistribution, which assumes
+    a primary mass and mass ratio model. This also uses a
+    pairing function for the joint probability distribution.
+
+    Implements low-mass smoothing on m1 and m2. Requires p_m1,
+    p_m2, and a pairing function to be implemented.
+
+    Parameters
+    ==========
+    mmin: float
+        The minimum mass considered for numerical normalization
+    mmax: float
+        The maximum mass considered for numerical normalization
+    """
+
+    # if the models should have differently named, need to
+    # define a function for secondary_model
+    primary_model = None
+    secondary_model = None
+    pairing_function = None
+
+    @property
+    def variable_names(self):
+        vars = getattr(
+            self.primary_model,
+            "variable_names",
+            inspect.getfullargspec(self.primary_model).args[1:],
+        )
+        # only add variables that aren't in mass1 model
+        model2_names = getattr(
+            self.secondary_model,
+            "variable_names",
+            inspect.getfullargspec(self.secondary_model).args[1:],
+        )
+        unique_model2_names = [name for name in model2_names if name not in vars]
+        vars += unique_model2_names
+        
+        # variables in pairing function (skip m1 and m2)
+        pairing_names = getattr(
+            self.pairing_function,
+            "variable_names",
+            inspect.getfullargspec(self.pairing_function).args[2:],
+        )
+        vars += pairing_names
+        
+        # smoothing parameter
+        vars += ["delta_m"]
+        vars = set(vars).difference(self.kwargs.keys())
+        return vars
+
+    def __init__(self, mmin=2, mmax=100, normalization_shape=1000):
+        self.mmin = mmin
+        self.mmax = mmax
+        self.m1s = xp.linspace(mmin, mmax, normalization_shape)
+        self.m2s = xp.linspace(mmin, mmax, normalization_shape)
+        self.dm1 = self.m1s[1] - self.m1s[0]
+        self.dm2 = self.m2s[1] - self.m2s[0]
+        self.m1s_grid, self.m2s_grid = xp.meshgrid(self.m1s, self.m2s)
+
+    def __call__(self, dataset, *args, **kwargs):
+        mmin = kwargs.get("mmin", self.mmin)
+        mmax = kwargs.get("mmax", self.mmax)
+        if "jax" not in xp.__name__:
+            if mmin < self.mmin:
+                raise ValueError(
+                    "{self.__class__}: mmin ({mmin}) < self.mmin ({self.mmin})"
+                )
+            if mmax > self.mmax:
+                raise ValueError(
+                    "{self.__class__}: mmax ({mmax}) > self.mmax ({self.mmax})"
+                )
+           
+        # separate arguments for various models
+        kwargs1 = {key: kwargs[key] for key in (self.model1_vars + ['delta_m'])}
+        kwargs2 = {key: kwargs[key] for key in (self.model2_vars + ['delta_m'])}
+        p_m1 = self.p_m1(dataset, **kwargs1, **self.kwargs)
+        p_m2 = self.p_m2(dataset, **kwargs2, **self.kwargs)
+            
+        kwargs3 = {key: kwargs[key] for key in self.pairing_vars}
+        f_q_Mtot = self.f_q_Mtot(dataset, **kwargs3)
+                        
+        prob = _primary_secondary_general(dataset, p_m1, p_m2) * f_q_Mtot
+        prob = xp.where(dataset['mass_2'] / dataset['mass_1'] >= kwargs3['q_min'], prob, 0)
+        norm = self.norm_p_m1_m2(**kwargs)
+        return prob / norm
+    
+    def p_m1(self, dataset, normalize=True, **kwargs):
+        # not normalized!!!
+        mmin = kwargs.get("mmin", self.mmin)
+        delta_m = kwargs.pop("delta_m", 0)
+        p_m = self.__class__.primary_model(dataset["mass_1"], **kwargs)
+        p_m *= self.smoothing(
+            dataset["mass_1"], mmin=mmin, mmax=self.mmax, delta_m=delta_m
+        )
+        # could normalize to display it, otherwise we will normalize joint distribution
+        if normalize == True:
+            norm = self.norm_p_m1(delta_m=delta_m, **kwargs)
+        else:
+            norm = 1
+        return p_m / norm
+    
+    def norm_p_m1(self, delta_m, **kwargs):
+        """Calculate the normalisation factor for the primary mass"""
+        mmin = kwargs.get("mmin", self.mmin)
+        if "jax" not in xp.__name__ and delta_m == 0:
+            return 1
+        p_m = self.__class__.primary_model(self.m1s, **kwargs)
+        p_m *= self.smoothing(self.m2s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
+
+        norm = xp.nan_to_num(xp.trapz(p_m, self.m1s)) * (delta_m != 0) + 1 * (
+            delta_m == 0
+        )
+        return norm
+
+    def p_m2(self, dataset, normalize=True, **kwargs):
+        # same idea as p_m1 but using the secondary model
+        mmin = kwargs.get("mmin", self.mmin)
+        delta_m = kwargs.pop("delta_m", 0)
+        p_m = self.__class__.secondary_model(dataset["mass_2"], **kwargs)
+        p_m *= self.smoothing(
+            dataset["mass_2"], mmin=mmin, mmax=self.mmax, delta_m=delta_m
+        )
+        # could normalize to display it, otherwise we will normalize joint distribution
+        if normalize == True:
+            norm = self.norm_p_m2(delta_m=delta_m, **kwargs)
+        else:
+            norm = 1
+        return p_m / norm
+
+    def norm_p_m2(self, delta_m, **kwargs):
+        """Calculate the normalisation factor for the secondary mass"""
+        # same idea as norm_p_m2 but using the secondary model
+        mmin = kwargs.get("mmin", self.mmin)
+        if "jax" not in xp.__name__ and delta_m == 0:
+            return 1
+        p_m = self.__class__.secondary_model(self.m2s, **kwargs)
+        p_m *= self.smoothing(self.m2s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
+
+        norm = xp.nan_to_num(xp.trapz(p_m, self.m2s)) * (delta_m != 0) + 1 * (
+            delta_m == 0
+        )
+        return norm
+    
+    def f_q_Mtot(self, dataset, **kwargs):
+        mass_ratio = dataset['mass_2'] / dataset['mass_1']
+        total_mass = dataset['mass_2'] + dataset['mass_1']
+        return self.__class__.pairing_function(mass_ratio, total_mass, **kwargs)
+    
+    def norm_p_m1_m2(self, **kwargs):
+        norm_data = {'mass_1': self.m1s_grid, 'mass_2': self.m2s_grid}
+        
+        kwargs1 = {key: kwargs[key] for key in (self.model1_vars + ['delta_m'])}
+        kwargs2 = {key: kwargs[key] for key in (self.model2_vars + ['delta_m'])}
+        p_m1 = self.p_m1(norm_data, **kwargs1, **self.kwargs)
+        p_m2 = self.p_m2(norm_data, **kwargs2, **self.kwargs)
+            
+        kwargs3 = {key: kwargs[key] for key in self.pairing_vars}
+        f_q_Mtot = self.f_q_Mtot(norm_data, **kwargs3)
+                        
+        prob = _primary_secondary_general(norm_data, p_m1, p_m2) * f_q_Mtot
+        prob = xp.where(self.m2s_grid <= self.m1s_grid, prob, 0)
+        prob = xp.where(self.m2s_grid / self.m1s_grid >= kwargs3['q_min'], prob, 0)
+
+        integrated_m2s = xp.nan_to_num(xp.trapz(prob, self.m2s, axis=1))
+        norms = xp.nan_to_num(xp.trapz(integrated_m2s, self.m1s, axis=0))
+        return norms
+
+
+class GeneralPairedPrimarySecondaryIdentical(BaseSmoothedPairedDistribution):
+    """
+    Powerlaw + peak model for two-dimensional mass distribution with
+    low mass smoothing. Model for primary and secondary mass have
+    identical parameters.
+
+    Parameters
+    ----------
+    dataset: dict
+        Dictionary of numpy arrays for 'mass_1' and 'mass_2'.
+    alpha: float
+        Negative power law exponent for general black hole mass function.
+    mmin: float
+        Minimum black hole mass.
+    mmax: float
+        Maximum black hole mass.
+    lam: float
+        Fraction of black holes in the Gaussian component (primary mass).
+    mpp: float
+        Mean of the Gaussian component for more massive black hole.
+    sigpp: float
+        Standard deviation of the Gaussian component for more massive black hole.
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    delta_m: float
+        Rise length of the low end of the mass distribution for more massive black hole.
+    beta_q: float
+        Slope of power law in mass ratio for pairing function.
+    beta_M: float
+        Slope of power law in total mass for pairing function
+    q_min: float
+        Minimum possible mass ratio for pairing function
+
+    Notes
+    -----
+    The Gaussian components are bounded between [`mmin`, `self.mmax`].
+    This means that the `mmax` parameter is _not_ the global maximum.
+    """
+
+    model1_vars = ['alpha', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp']
+    model2_vars = ['alpha', 'mmin', 'mmax', 'lam', 'mpp', 'sigpp']
+    
+    def model1(mass, alpha, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+    
+    primary_model = model1
+    
+    # if mass2 model has unique parameters, their names can be changed here
+    def model2(mass, alpha, mmin, mmax, lam, mpp, sigpp, gaussian_mass_maximum=100):
+        return two_component_single(mass, alpha, mmin, mmax, lam, mpp, sigpp,
+                                    gaussian_mass_maximum=gaussian_mass_maximum)
+        
+    secondary_model = model2
+    
+    pairing_vars = ['beta_q', 'beta_M', 'q_min']
+    def pairing_function(mass_ratio, total_mass, beta_q, beta_M, q_min):
+        return xp.where(mass_ratio >= q_min, mass_ratio**(beta_q) * total_mass**(beta_M), 0.0)
+    
+    pairing_function = pairing_function
+
+    @property
+    def kwargs(self):
+        return dict(gaussian_mass_maximum=self.mmax)
+
+def two_component_single_evo_many(
+    mass, redshift, alpha, mmin, mmax, lam, mpp, sigpp, alpha_z, lam_z, mpp_z, gaussian_mass_maximum=100
+):
+    r"""
+    Power law model for one-dimensional mass distribution with a Gaussian component.
+    Power law spectral index made to evolve with redshift.
+
+    .. math::
+        p(m) &= (1 - \lambda_m - \lambda_z z) p_{\text{pow}} + (\lambda_m + \lambda_z z) p_{\text{norm}}
+
+        p_{\text{pow}}(m) &\propto m^{-\alpha + wz} : m_\min \leq m < m_\max
+
+        p_{\text{norm}}(m) &\propto \exp\left(-\frac{(m - \mu_{m} - \mu_{z} z)^2}{2\sigma^2_m}\right)
+
+    Parameters
+    ----------
+    mass: array-like
+        Array of mass values (:math:`m`).
+    alpha: float
+        Negative power law exponent for the black hole distribution (:math:`\alpha`).
+    mmin: float
+        Minimum black hole mass (:math:`m_\min`).
+    mmax: float
+        Maximum black hole mass (:math:`m_\max`).
+    lam: float
+        Fraction of black holes in the Gaussian component (:math:`\lambda_m`).
+    mpp: float
+        Mean of the Gaussian component (:math:`\mu_m`).
+    sigpp: float
+        Standard deviation of the Gaussian component (:math:`\sigma_m`).
+    alpha_z: float
+        slope of redshift evolution in power law index (:math:`\alpha_z`).
+    lam_z: float
+        slope of redshift evolution in peak area (:math:`\lambda_z`).
+    mpp_z: float
+        slope of redshift evolution in mean of peak (:math:`\mu_z`).
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    """
+    p_pow = powerlaw(mass, alpha=-alpha + alpha_z*redshift, high=mmax, low=mmin)
+    p_norm = truncnorm(mass, mu=mpp + mpp_z*redshift, sigma=sigpp, high=gaussian_mass_maximum, low=mmin)
+    prob = (1 - lam - lam_z*redshift) * p_pow + (lam + lam_z*redshift) * p_norm
+    return prob
+
+class PowerlawPeakEvoMany(PowerlawPeakEvoAlpha):
+    r"""
+    Power law model for one-dimensional mass distribution with a Gaussian component.
+    Power law spectral index made to evolve with redshift.
+
+    .. math::
+        p(m) &= (1 - \lambda_m - \lambda_z z) p_{\text{pow}} + (\lambda_m + \lambda_z z) p_{\text{norm}}
+
+        p_{\text{pow}}(m) &\propto m^{-\alpha + wz} : m_\min \leq m < m_\max
+
+        p_{\text{norm}}(m) &\propto \exp\left(-\frac{(m - \mu_{m} - \mu_{z} z)^2}{2\sigma^2_m}\right)
+
+    Parameters
+    ----------
+    mass: array-like
+        Array of mass values (:math:`m`).
+    alpha: float
+        Negative power law exponent for the black hole distribution (:math:`\alpha`).
+    mmin: float
+        Minimum black hole mass (:math:`m_\min`).
+    mmax: float
+        Maximum black hole mass (:math:`m_\max`).
+    lam: float
+        Fraction of black holes in the Gaussian component (:math:`\lambda_m`).
+    mpp: float
+        Mean of the Gaussian component (:math:`\mu_m`).
+    sigpp: float
+        Standard deviation of the Gaussian component (:math:`\sigma_m`).
+    alpha_z: float
+        slope of redshift evolution in power law index (:math:`\alpha_z`).
+    lam_z: float
+        slope of redshift evolution in peak area (:math:`\lambda_z`).
+    mpp_z: float
+        slope of redshift evolution in mean of peak (:math:`\mu_z`).
+    gaussian_mass_maximum: float, optional
+        Upper truncation limit of the Gaussian component. (default: 100)
+    """
+
+    primary_model = two_component_single_evo_many
